@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+openai
+pinecone-client
+python-multipart
+requests
+PyMuPDF
+python-dotenv
