@@ -1,62 +1,59 @@
 import os
 import fitz  # PyMuPDF
-from dotenv import load_dotenv
-from typing import List
 from openai import OpenAI
-from pinecone import Pinecone, ServerlessSpec
+import pinecone
+from dotenv import load_dotenv
 
 load_dotenv()
 
-# Load environment variables
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_REGION = "us-west-2"  # Update as per your actual region
-INDEX_NAME = "rag-index"
+PINECONE_ENV = os.getenv("PINECONE_ENV")
+PINECONE_INDEX = os.getenv("PINECONE_INDEX", "rag-index")
 
-# Initialize OpenAI
-openai = OpenAI(api_key=OPENAI_API_KEY)
+client = OpenAI(api_key=OPENAI_API_KEY)
+pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENV)
 
-# Initialize Pinecone (new SDK)
-pc = Pinecone(api_key=PINECONE_API_KEY)
+# Ensure Pinecone index exists
+if PINECONE_INDEX not in [index.name for index in pinecone.list_indexes()]:
+    pinecone.create_index(PINECONE_INDEX, dimension=1536, metric="cosine")
 
-# Create Pinecone index if not exists
-def init_pinecone():
-    if INDEX_NAME not in pc.list_indexes().names():
-        pc.create_index(
-            name=INDEX_NAME,
-            dimension=1536,  # OpenAI embedding dimension
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region=PINECONE_REGION)
-        )
-    return pc.Index(INDEX_NAME)
+index = pinecone.Index(PINECONE_INDEX)
 
-# Load PDF & split into chunks
-def load_pdf_chunks(path: str, chunk_size: int = 300) -> List[str]:
-    doc = fitz.open(path)
-    text = ""
+def ingest_pdf_to_pinecone(pdf_path):
+    doc = fitz.open(pdf_path)
+    chunks = []
     for page in doc:
-        text += page.get_text()
+        text = page.get_text()
+        if text.strip():
+            chunks.append(text.strip())
     doc.close()
-    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
-# Get OpenAI Embeddings
-def get_embeddings(chunks: List[str]) -> List[List[float]]:
-    embeddings = []
-    for chunk in chunks:
-        response = openai.embeddings.create(
-            input=chunk,
-            model="text-embedding-3-small"
-        )
-        embeddings.append(response.data[0].embedding)
-    return embeddings
+    upserts = []
+    for i, chunk in enumerate(chunks):
+        embedding = get_embedding(chunk)
+        upserts.append((f"{pdf_path}_{i}", embedding, {"text": chunk}))
+    
+    index.upsert(vectors=upserts)
+    return len(upserts)
 
-# Upload to Pinecone index
-def upload_to_pinecone(index, chunks: List[str], embeddings: List[List[float]]):
-    vectors = []
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
-        vectors.append({
-            "id": f"chunk-{i}",
-            "values": embedding,
-            "metadata": {"text": chunk}
-        })
-    index.upsert(vectors=vectors)
+def get_embedding(text):
+    res = client.embeddings.create(
+        input=[text],
+        model="text-embedding-3-small"
+    )
+    return res.data[0].embedding
+
+def query_pinecone_with_gpt(query):
+    query_embedding = get_embedding(query)
+    result = index.query(vector=query_embedding, top_k=5, include_metadata=True)
+    contexts = [match["metadata"]["text"] for match in result.matches]
+    context_text = "\n\n".join(contexts)
+
+    prompt = f"Answer the following question using the provided context:\n\nContext:\n{context_text}\n\nQuestion:\n{query}"
+
+    response = client.chat.completions.create(
+        model="gpt-4",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message.content
