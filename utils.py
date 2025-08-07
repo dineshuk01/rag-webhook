@@ -1,73 +1,62 @@
-import fitz  # PyMuPDF
-import requests
-from openai import OpenAI
-import openai
-import pinecone
 import os
+import fitz  # PyMuPDF
 from dotenv import load_dotenv
 from typing import List
+from openai import OpenAI
+from pinecone import Pinecone, ServerlessSpec
 
 load_dotenv()
 
-# Load keys
-openai.api_key = os.getenv("OPENAI_API_KEY")
-pinecone.init(api_key=os.getenv("PINECONE_API_KEY"), environment=os.getenv("PINECONE_ENV"))
-index = pinecone.Index(os.getenv("PINECONE_INDEX"))
+# Load environment variables
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
+PINECONE_REGION = "us-west-2"  # Update as per your actual region
+INDEX_NAME = "rag-index"
 
-# ----------- PDF Extractor -----------
-def extract_text_from_pdf_url(url: str) -> str:
-    response = requests.get(url)
-    with open("temp.pdf", "wb") as f:
-        f.write(response.content)
+# Initialize OpenAI
+openai = OpenAI(api_key=OPENAI_API_KEY)
 
-    doc = fitz.open("temp.pdf")
+# Initialize Pinecone (new SDK)
+pc = Pinecone(api_key=PINECONE_API_KEY)
+
+# Create Pinecone index if not exists
+def init_pinecone():
+    if INDEX_NAME not in pc.list_indexes().names():
+        pc.create_index(
+            name=INDEX_NAME,
+            dimension=1536,  # OpenAI embedding dimension
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region=PINECONE_REGION)
+        )
+    return pc.Index(INDEX_NAME)
+
+# Load PDF & split into chunks
+def load_pdf_chunks(path: str, chunk_size: int = 300) -> List[str]:
+    doc = fitz.open(path)
     text = ""
     for page in doc:
         text += page.get_text()
-    return text
+    doc.close()
+    return [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
 
-# ----------- Chunk Text -----------
-def split_text(text: str, chunk_size=300) -> List[str]:
-    words = text.split()
-    return [' '.join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+# Get OpenAI Embeddings
+def get_embeddings(chunks: List[str]) -> List[List[float]]:
+    embeddings = []
+    for chunk in chunks:
+        response = openai.embeddings.create(
+            input=chunk,
+            model="text-embedding-3-small"
+        )
+        embeddings.append(response.data[0].embedding)
+    return embeddings
 
-# ----------- Embedding & Store -----------
-def embed_and_store_chunks(chunks: List[str]):
-    for i, chunk in enumerate(chunks):
-        response = openai.Embedding.create(input=chunk, model="text-embedding-ada-002")
-        vector = response['data'][0]['embedding']
-        index.upsert([(f"chunk-{i}", vector, {"text": chunk})])
-
-# ----------- Query Parser -----------
-def parse_question(question: str) -> str:
-    prompt = f"Extract the core intent and key terms from: {question}"
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content
-
-# ----------- Search Chunks -----------
-def search_chunks(query: str, top_k=3) -> List[str]:
-    emb = openai.Embedding.create(input=query, model="text-embedding-ada-002")["data"][0]["embedding"]
-    results = index.query(vector=emb, top_k=top_k, include_metadata=True)
-    return [match["metadata"]["text"] for match in results["matches"]]
-
-# ----------- Answer Generation -----------
-def generate_answer(question: str, matched_chunks: List[str]) -> str:
-    context = "\n".join(matched_chunks)
-    prompt = f"""Answer the question based on the following document context:
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:"""
-
-    response = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message.content.strip()
+# Upload to Pinecone index
+def upload_to_pinecone(index, chunks: List[str], embeddings: List[List[float]]):
+    vectors = []
+    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+        vectors.append({
+            "id": f"chunk-{i}",
+            "values": embedding,
+            "metadata": {"text": chunk}
+        })
+    index.upsert(vectors=vectors)
