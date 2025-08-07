@@ -1,29 +1,28 @@
-from fastapi import FastAPI, Request, Header
-from pydantic import BaseModel
-from typing import List
-from utils import extract_text_from_pdf_url, split_text, embed_and_store_chunks, parse_question, search_chunks, generate_answer
+from fastapi import FastAPI, UploadFile, File, Query
+from fastapi.responses import JSONResponse
+from utils import ingest_pdf_to_pinecone, query_pinecone_with_gpt
+import os
 
 app = FastAPI()
 
-class QueryRequest(BaseModel):
-    documents: str
-    questions: List[str]
+@app.post("/webhook/upload/")
+async def upload_pdf(file: UploadFile = File(...)):
+    try:
+        content = await file.read()
+        filename = file.filename
+        with open(filename, "wb") as f:
+            f.write(content)
+
+        response = ingest_pdf_to_pinecone(filename)
+        os.remove(filename)
+        return {"message": "File uploaded and ingested", "chunks_uploaded": response}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/hackrx/run")
-async def run_rag_api(data: QueryRequest, authorization: str = Header(...)):
-    # Step 1: Load and Extract
-    text = extract_text_from_pdf_url(data.documents)
-
-    # Step 2: Chunk and Embed
-    chunks = split_text(text)
-    embed_and_store_chunks(chunks)
-
-    # Step 3: Process Each Question
-    answers = []
-    for question in data.questions:
-        parsed = parse_question(question)
-        matched_chunks = search_chunks(parsed)
-        answer = generate_answer(question, matched_chunks)
-        answers.append(answer)
-
-    return {"answers": answers}
+async def hackrx_query(query: str = Query(..., description="User's natural language question")):
+    try:
+        response = query_pinecone_with_gpt(query)
+        return {"query": query, "answer": response}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
